@@ -170,7 +170,7 @@ def runApp():
     runContainer(config["appAccessPort"], config["appContainerPort"], config["imageName"], "--local", appName)
     print("{} started".format(appName))
 
-# for dependencie images might be based on dockerhub repos so we need to get them
+# for dependencies, images might be based on dockerhub repos so we need to get them
 def getImage(imageTag, repo):
     try:
         dockerCli.images.get(imageTag)
