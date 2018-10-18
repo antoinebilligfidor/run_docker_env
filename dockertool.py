@@ -1,4 +1,8 @@
+
+#!/bin/sh
+
 # Main script, it provides the user with a set of tool to automate local testing
+# Pnly supports Windows and MacOS at the moment
 
 import subprocess,os, platform, json, sys, time, datetime
 try:
@@ -12,18 +16,17 @@ try:
     import unittests as tests
 except:
     print("could not find unittests.py in ../test/")
-    check = inputField('Continue ? (Y/N)')
-    if check != 'Y':
-        print("Cancelled")
-        exit()
+    exit()
 try:
     import docker
 except ImportError:
-    subprocess.check_call(["python", '-m', 'pip', 'install', 'docker']) 
+    subprocess.check_call(["python3", '-m', 'pip', 'install', 'docker']) 
     import docker
 import logging
 
-#prevents from having too much information on screen
+
+import requests
+
 logging.disable(logging.DEBUG)
 
 dockerCli = docker.from_env()
@@ -35,7 +38,17 @@ runningOn = ""
 if (platform.system() == "Windows"):
     print("Running on Windows")
     runningOn = "Windows"
-
+if (platform.system() == "Darwin"):
+    print("Running on MacOS")
+    subprocess.check_call(["sudo","ifconfig", 'lo0', 'alias', '172.16.123.1']) 
+    runningOn = "Darwin"
+if runningOn == "Darwin":
+    try:
+        import appscript
+    except ImportError:
+        subprocess.check_call(["python3", '-m', 'pip', 'install', 'appscript']) 
+        import appscript
+    import requests
 
 args = {}
 for x in range(2, len(sys.argv)):
@@ -118,7 +131,6 @@ def configApp():
     with open('config.json', 'w+') as outfile:
         json.dump(config, outfile)
 
-
 def displayHelp():
     print("\nusage : {} COMMAND [OPTIONS]\n\n".format(appName))
     print("tool to manage {} excecution locally, testing and deployment to gcp host\n".format(appName))
@@ -145,7 +157,6 @@ def displayHelp():
         print("- run docker-machine restart {}".format(config["dockerVM"]))
     print("\n\n")
 
-
 # run the App container
 def runApp():
     print("Checking availability on port {} ...".format(config["appAccessPort"]))
@@ -156,19 +167,38 @@ def runApp():
         except:
             print("Found container on port {}".format(config["appAccessPort"]))
         print("Killing process")
-        with open(os.devnull, 'w') as fp:
-            #remove existing app window
-            cmd = subprocess.Popen("taskkill /FI \"WindowTitle eq {}*\"".format(appName), stdout=fp)
-            cmd.wait()
+        if runningOn == "Windows":
+            with open(os.devnull, 'w') as fp:
+                cmd = subprocess.Popen("taskkill /FI \"WindowTitle eq {}*\"".format(appName), stdout=fp)
+                cmd.wait()   
         print("Killing container ...")
         runningContainers[0].remove(force=True)
         print("Container killed")
     print("Building \"{}\" Docker image ...".format(config["imageName"]))
-    proc = subprocess.Popen("docker build -t {} -f ../Dockerfile ..".format(config["imageName"]))
-    proc.communicate()
-    proc.wait()
-    runContainer(config["appAccessPort"], config["appContainerPort"], config["imageName"], "--local", appName)
+    
+    if runningOn == "Windows":
+        proc = subprocess.Popen("docker build -t {} -f ../Dockerfile ..".format(config["imageName"]))
+        proc.communicate()
+        proc.wait()
+    else:
+        proc = subprocess.check_call(["docker", "build", "-t", config["imageName"], "-f", "../Dockerfile", ".."])
+    if runningOn != "Windows":
+        runContainer(config["appAccessPort"], config["appContainerPort"], config["imageName"], "--local --ip=172.16.123.1", appName)
+    else:
+        runContainer(config["appAccessPort"], config["appContainerPort"], config["imageName"], "--local", appName)
+    while(True):
+        try:
+            if runningOn == "Darwin":
+                result = requests.get('http://127.0.0.1:5000/api/healthz')
+            else:
+                result = requests.get('http://192.168.99.100:5000/api/healthz')
+            if result.status_code == 200:
+                break
+        except:
+            pass
+        time.sleep(1)
     print("{} started".format(appName))
+
 
 # for dependencies, images might be based on dockerhub repos so we need to get them
 def getImage(imageTag, repo):
@@ -177,45 +207,48 @@ def getImage(imageTag, repo):
     except:
         print("[{}] not found locally".format(imageTag))
         if imageTag == "cloudsql:latest":
-            #for cloudsql, credentials are required to access your google cloud sql database, so you need to provide a valid cred.json file containing the API key
             print("Creating Dockerfile.tmp for cloudsql:latest ...")
             f = open("Dockerfile.tmp", "w+")
             f.write("FROM antoinebillig/cloudsqlproxy\nCOPY cred.json ./\nENV GOOGLE_APPLICATION_CREDENTIALS cred.json\nENTRYPOINT [\"./cloud_sql_proxy\", \"-instances={}:{}:{}=tcp:0.0.0.0:3306\"]".format(config["projectId"],config["SQLRegion"],config["SQLInstance"]))
             f.close()
             print("Building image ...")
             with open(os.devnull, 'w') as fp:
-                try:
+                if runningOn == "Windows":
                     proc = subprocess.Popen("docker build -t cloudsql:latest -f Dockerfile.tmp .")
                     proc.communicate()
                     proc.wait()
-                except:
-                    print("Error while building cloudsql image")
-                    os.remove("Dockerfile.tmp")
-                    exit()
+                else:
+                    proc = subprocess.check_call(["docker", "build", "-t", "cloudsql:latest", "-f", "Dockerfile.tmp", "."])
             os.remove("Dockerfile.tmp")
             print("Image built successfully")
 
         else:
             print("Pulling [{}] from Dockerhub... ".format(imageTag))
             try:
-                proc = subprocess.Popen("docker pull {}".format(repo))
-                proc.communicate()
-                proc.wait()
+                if runningOn == "Windows":
+                    proc = subprocess.Popen("docker pull {}".format(repo))
+                    proc.communicate()
+                    proc.wait()
+                else:
+                    proc = subprocess.check_call(["docker", "pull", repo])
             except:
                 print("Could not find {} image on Dockerhub".format(imageTag))
                 exit()
             print("Image pulled!")
             pubsubImg = dockerCli.images.get(repo)
-            #tagging image with desired tag instead of repo name
             print("Tagging image")
             pubsubImg.tag(imageTag)
             print("Image tagged")
 
 
-# Helper to run a container. It returns when the container has a 'running' status.
+
+# Helper to run a container. It returns when the container has a 'running' status.            
 def runContainer(appPort, containerPort, image, imageOptions, containerName):
     print("Starting new container ...")
-    os.popen("Start \"{}\" cmd /c cmd /k docker run -p {}:{} {} {}".format(containerName, appPort,containerPort,image, imageOptions))
+    if runningOn != "Windows":
+        appscript.app('Terminal').do_script("docker run -t -i -p {}:{} --add-host=docker.local:172.16.123.1 {} {}".format(appPort,containerPort,image, imageOptions))
+    else:
+        os.popen("Start \"{}\" cmd /c cmd /k docker run -p {}:{} {} {}".format(containerName, appPort,containerPort,image, imageOptions))
     print("Waiting for {} to start ...".format(containerName))
     while True:
         runningContainers = dockerCli.containers.list(all=True, filters={'status':"running",'expose':"{}/tcp".format(appPort)})
@@ -223,7 +256,8 @@ def runContainer(appPort, containerPort, image, imageOptions, containerName):
             break
         time.sleep(1) 
 
-# Helper to set up and launch a container. It kills and remove currently running container on a given port then starts the new container.
+
+# Helper to set up and launch a container. It kills and remove currently running container on a given port then starts the new container.        
 def startContainer(containerName, appPort, containerPort, imageTag, repo, appOptions, replace = False):
     print("Checking {} on port {} ...".format(containerName, appPort))
     runningContainers = dockerCli.containers.list(all=True, filters={'status':"running",'expose':"{}/tcp".format(appPort)})
@@ -236,9 +270,10 @@ def startContainer(containerName, appPort, containerPort, imageTag, repo, appOpt
             if not replace:
                 print("An container is already running on port {} and is not detected being a {} image".format(appPort, containerName))
             print("Killing process")
-            with open(os.devnull, 'w') as fp:
-                cmd = subprocess.Popen("taskkill /FI \"WindowTitle eq {}*\"".format(containerName), stdout=fp)
-                cmd.wait()
+            if runningOn == "Windows":
+                with open(os.devnull, 'w') as fp:
+                    cmd = subprocess.Popen("taskkill /FI \"WindowTitle eq {}*\"".format(containerName), stdout=fp)
+                    cmd.wait()
             print("Killing container ...")
             runningContainers[0].remove(force=True)
             print("Container killed")
@@ -249,24 +284,30 @@ def startContainer(containerName, appPort, containerPort, imageTag, repo, appOpt
         runContainer(appPort, containerPort, imageTag, appOptions, containerName)
     print("{} is running".format(containerName))
 
-# Helper to run app dependencies 
+
+# Helper to run app dependencies
 def runDependencies(replace = False):
     startContainer("PubSub", "8085", "8085", "pubsub_sim:latest", "antoinebillig/pubsub_sim", "", replace)
     startContainer("CloudSQL", "3306", "3306", "cloudsql:latest", "antoinebillig/cloudsqlproxy", "", replace)
 
+
 # Helper to run the user defined scripts. The test file should return 'KO' when failing, everything else will be considered as OK
 def runTests():
     print("Testing {}".format(appName))
-    testRes = tests.main(["../test/unittests.py"])
-
+    #
+    if runningOn == "Windows":
+        testRes = tests.main(["../test/unittests.py", "192.168.99.100"])
+    else:
+        testRes = tests.main(["../test/unittests.py", "127.0.0.1"])
     if testRes == "KO":
         print("Tests failed")
         exit()
     else:
         print("Tests succeeded")
 
+
 # Function to manually update an existing deployment on kubernetes.
-# It first create a tag that include the gcp container registery URL as well as the image name followed by the key word manual for identification as well as a timestamp for the tag.
+# It first create a tag that include the gcp container registery URL as well as the image name followed by the key word manual for identification as well as a timestamp for the tag.        
 def deployApp():
     print("Deploying {} to Kubernetes ...".format(appName))
     date = datetime.datetime.today()
@@ -275,14 +316,19 @@ def deployApp():
     imageName = "{}/{}/{}manual".format(config["gcpRegion"], config["projectId"], config["imageName"])
     pubsubImg = dockerCli.images.get("{}:latest".format(config["imageName"]))
     pubsubImg.tag("{}:{}".format(imageName, imageTag))
-    proc = subprocess.Popen("docker push {}:{}".format(imageName, imageTag))
-    proc.communicate()
-    proc.wait()
-    proc = subprocess.Popen("kubectl set image deployment {} {}={}:{}".format(config["deploymentName"], config["gcpContainerName"], imageName, imageTag))
-    proc.communicate()
-    proc.wait()
+    if runningOn == "Windows":
+        proc = subprocess.Popen("docker push {}:{}".format(imageName, imageTag))
+        proc.communicate()
+        proc.wait()
+        proc = subprocess.Popen("kubectl set image deployment {} {}={}:{}".format(config["deploymentName"], config["gcpContainerName"], imageName, imageTag))
+        proc.communicate()
+        proc.wait()
+    else:
+        proc = subprocess.check_call(["docker", "push", "{}:{}".format(imageName, imageTag)])
+        proc = subprocess.check_call(["kubectl", "set", "image", "deployment", config["deploymentName"], "{}={}:{}".format(config["gcpContainerName"], imageName, imageTag)])
 
-# Helper to clean unused images and containers, as well as deployment images
+
+# Helper to clean unused images and containers, as well as deployment images        
 def cleanSystem():
     containers = dockerCli.containers.list()
     for container in containers:
@@ -294,7 +340,6 @@ def cleanSystem():
     for image in images:
         if len(image.tags) > 0 and appImages in image.tags[0]:  
             dockerCli.images.remove(image=image.id, force=True)
-    print("Success")
 
 
 initApp()
